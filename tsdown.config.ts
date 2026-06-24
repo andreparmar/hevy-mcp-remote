@@ -34,7 +34,7 @@ if (
 }
 
 export default defineConfig({
-	entry: ["src/index.ts", "src/cli.ts"],
+	entry: ["src/index.ts", "src/cli.ts", "src/http-server.ts"],
 	format: ["esm"],
 	target: "esnext",
 	define: {

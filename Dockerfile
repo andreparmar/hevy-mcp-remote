@@ -1,8 +1,27 @@
-# hevy-mcp Docker support was retired in favor of local stdio usage via npx.
-# This file intentionally fails to build to make the deprecation explicit.
-# Previously published images remain available on GHCR for historical purposes.
+FROM node:22-alpine AS builder
 
-FROM alpine:3.20 AS deprecated
-RUN echo "hevy-mcp Docker images are no longer maintained.\n" \
-	&& echo "Install locally instead: npx hevy-mcp" \
-	&& exit 1
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci --ignore-scripts
+
+COPY . .
+RUN npm run build
+
+# ---- runtime ----
+FROM node:22-alpine AS runtime
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci --omit=dev --ignore-scripts
+
+COPY --from=builder /app/dist ./dist
+
+ENV NODE_ENV=production
+ENV PORT=3000
+
+EXPOSE 3000
+
+# Railway injects HEVY_API_KEY, OAUTH_SECRET, and PUBLIC_URL at deploy time.
+CMD ["node", "dist/http-server.mjs"]

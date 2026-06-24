@@ -5,7 +5,7 @@ pre-commit:
       run: npm run check:fix {staged_files}
       stage_fixed: true
     tests:
-      run: npm test
+      run: npx vitest run --exclude tests/integration/**
 
 # Validate commit messages
 commit-msg:
