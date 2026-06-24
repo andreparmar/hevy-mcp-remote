@@ -70,6 +70,9 @@ export async function runHttpServer() {
 
 	// Root Express app — handles OAuth endpoints + /mcp
 	const app = createMcpExpressApp({ host: "0.0.0.0" });
+	// Railway (and most PaaS) sit behind a reverse proxy that adds X-Forwarded-For.
+	// Without this, express-rate-limit (used by mcpAuthRouter) throws ERR_ERL_UNEXPECTED_X_FORWARDED_FOR.
+	app.set("trust proxy", true);
 	app.use(express.urlencoded({ extended: false }));
 	app.use(express.json());
 
