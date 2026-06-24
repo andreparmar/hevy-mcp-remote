@@ -73,7 +73,17 @@ export async function runHttpServer() {
 	app.use(express.urlencoded({ extended: false }));
 	app.use(express.json());
 
-	// OAuth 2.0 endpoints: /.well-known/*, /oauth/register, /oauth/authorize, /oauth/token
+	// Health check MUST be registered before mcpAuthRouter so it isn't
+	// intercepted by the auth middleware stack.
+	app.get("/health", (_req, res) => {
+		res.json({
+			status: "ok",
+			server: "hevy-mcp",
+			transport: "streamable-http",
+		});
+	});
+
+	// OAuth 2.0 endpoints: /.well-known/*, /register, /authorize, /token, /revoke
 	app.use(
 		mcpAuthRouter({
 			provider: oauthProvider,
@@ -176,14 +186,6 @@ export async function runHttpServer() {
 			.json({ error: "Session termination not supported in stateless mode" });
 	});
 
-	app.get("/health", (_req, res) => {
-		res.json({
-			status: "ok",
-			server: "hevy-mcp",
-			transport: "streamable-http",
-		});
-	});
-
 	app.listen(port, "0.0.0.0", () => {
 		console.log(`hevy-mcp HTTP server listening on port ${port}`);
 		console.log(`Public URL: ${publicUrl}`);
@@ -193,6 +195,14 @@ export async function runHttpServer() {
 		);
 	});
 }
+
+// Prevent a single bad request from killing the process
+process.on("uncaughtException", (err) => {
+	console.error("Uncaught exception:", err);
+});
+process.on("unhandledRejection", (reason) => {
+	console.error("Unhandled rejection:", reason);
+});
 
 // Self-invoke when used as an entry point (mirrors cli.ts pattern)
 void runHttpServer().catch((error: unknown) => {
