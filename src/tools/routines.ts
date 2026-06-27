@@ -256,7 +256,7 @@ export function registerRoutineTools(
 				routine: {
 					title,
 					folder_id: folderId ?? null,
-					notes: notes ?? "",
+					notes: notes || undefined,
 					exercises: exercises.map((exercise): PostRoutinesRequestExercise => {
 						const sets = exercise.sets.map((set): PostRoutinesRequestSet => {
 							const repRange = buildRepRange(set.repRange);
@@ -370,7 +370,7 @@ export function registerRoutineTools(
 				{
 					routine: {
 						title,
-						notes: notes ?? null,
+						notes: notes || null,
 						exercises: exercises.map((exercise): PutRoutinesRequestExercise => {
 							const sets = exercise.sets.map((set): PutRoutinesRequestSet => {
 								const repRange = buildRepRange(set.repRange);

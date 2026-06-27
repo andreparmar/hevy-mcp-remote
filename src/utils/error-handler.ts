@@ -75,10 +75,14 @@ export function createErrorResponse(
 	const formattedMessage = `${contextPrefix}Error: ${errorMessage}`;
 	const errorCodeSuffix = errorCode ? `, Code: ${errorCode}` : "";
 
-	// Log the error for server-side debugging with type information
+	// Log concise error summary — avoid dumping full Axios objects which flood logs
+	const logExtra = isAxiosError(error)
+		? `AxiosError: Request failed with status code ${error.response?.status ?? "unknown"}`
+		: error instanceof Error
+			? (error.stack ?? error.message)
+			: "";
 	console.error(
-		`${formattedMessage} (Type: ${errorType}${errorCodeSuffix})`,
-		error,
+		`${formattedMessage} (Type: ${errorType}${errorCodeSuffix}) ${logExtra}`,
 	);
 
 	return {
