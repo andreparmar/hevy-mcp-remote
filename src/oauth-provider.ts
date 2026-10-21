@@ -1,5 +1,14 @@
-import { randomBytes, createHash } from "node:crypto";
+import {
+	randomBytes,
+	createHash,
+	createHmac,
+	timingSafeEqual,
+} from "node:crypto";
 import type { Response } from "express";
+import {
+	InvalidGrantError,
+	InvalidTokenError,
+} from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import type { OAuthServerProvider } from "@modelcontextprotocol/sdk/server/auth/provider.js";
 import type { OAuthRegisteredClientsStore } from "@modelcontextprotocol/sdk/server/auth/clients.js";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
@@ -10,9 +19,10 @@ import type {
 } from "@modelcontextprotocol/sdk/shared/auth.js";
 import type { AuthorizationParams } from "@modelcontextprotocol/sdk/server/auth/provider.js";
 
-// In-memory stores — single-process. Railway restarts are fine since
-// claude.ai will re-authenticate automatically using the refresh token flow.
-const clients = new Map<string, OAuthClientInformationFull>();
+// Client IDs and tokens are HMAC-signed with OAUTH_SECRET instead of stored,
+// so sign-ins survive Railway restarts (an in-memory store lost them all and
+// Claude got 500s until a manual re-authorize). Only the 10-minute auth codes
+// live in memory. Rotating OAUTH_SECRET revokes every client and token.
 const authCodes = new Map<
 	string,
 	{
@@ -22,17 +32,58 @@ const authCodes = new Map<
 		expiresAt: number;
 	}
 >();
-const accessTokens = new Map<
-	string,
-	{ clientId: string; scopes: string[]; expiresAt: number }
->();
-const refreshTokens = new Map<
-	string,
-	{ clientId: string; scopes: string[]; expiresAt: number }
->();
+const ACCESS_TTL_S = 3600 * 24 * 90; // 90 days
+const REFRESH_TTL_S = 3600 * 24 * 365;
+
+type SignedClient = { k: "client"; r: string[]; n?: string; iat: number };
+type SignedToken = {
+	k: "access" | "refresh";
+	c: string;
+	exp: number;
+	j: string;
+};
 
 function generateToken(length = 32): string {
 	return randomBytes(length).toString("base64url");
+}
+
+function hmac(body: string): Buffer {
+	return createHmac("sha256", process.env.OAUTH_SECRET ?? "")
+		.update(body)
+		.digest();
+}
+
+function sign(payload: SignedClient | SignedToken): string {
+	const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
+	return `${body}.${hmac(body).toString("base64url")}`;
+}
+
+function verifySigned<T extends SignedClient | SignedToken>(
+	value: string,
+	kind: T["k"],
+): T | undefined {
+	const dot = value.lastIndexOf(".");
+	if (dot <= 0) return undefined;
+	const body = value.slice(0, dot);
+	const sig = Buffer.from(value.slice(dot + 1), "base64url");
+	const expected = hmac(body);
+	if (sig.length !== expected.length || !timingSafeEqual(sig, expected))
+		return undefined;
+	try {
+		const payload = JSON.parse(Buffer.from(body, "base64url").toString()) as T;
+		return payload.k === kind ? payload : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function issueToken(
+	kind: SignedToken["k"],
+	clientId: string,
+	ttl: number,
+): string {
+	const exp = Math.floor(Date.now() / 1000) + ttl;
+	return sign({ k: kind, c: clientId, exp, j: generateToken(8) });
 }
 
 function verifyPkce(verifier: string, challenge: string): boolean {
@@ -51,7 +102,17 @@ function escapeHtml(str: string): string {
 
 const clientsStore: OAuthRegisteredClientsStore = {
 	getClient(clientId: string) {
-		return clients.get(clientId);
+		const c = verifySigned<SignedClient>(clientId, "client");
+		if (!c) return undefined;
+		return {
+			client_id: clientId,
+			client_id_issued_at: c.iat,
+			client_name: c.n,
+			redirect_uris: c.r,
+			grant_types: ["authorization_code", "refresh_token"],
+			response_types: ["code"],
+			token_endpoint_auth_method: "none",
+		};
 	},
 	registerClient(
 		clientInfo: Omit<
@@ -59,15 +120,14 @@ const clientsStore: OAuthRegisteredClientsStore = {
 			"client_id" | "client_id_issued_at"
 		>,
 	) {
-		const clientId = generateToken(16);
 		const now = Math.floor(Date.now() / 1000);
-		const full: OAuthClientInformationFull = {
-			...clientInfo,
-			client_id: clientId,
-			client_id_issued_at: now,
-		};
-		clients.set(clientId, full);
-		return full;
+		const clientId = sign({
+			k: "client",
+			r: clientInfo.redirect_uris.map(String),
+			n: clientInfo.client_name,
+			iat: now,
+		});
+		return { ...clientInfo, client_id: clientId, client_id_issued_at: now };
 	},
 };
 
@@ -151,10 +211,10 @@ export class HevyOAuthProvider implements OAuthServerProvider {
 		authorizationCode: string,
 	): Promise<string> {
 		const entry = authCodes.get(authorizationCode);
-		if (!entry) throw new Error("Unknown authorization code");
+		if (!entry) throw new InvalidGrantError("Unknown authorization code");
 		if (Date.now() > entry.expiresAt) {
 			authCodes.delete(authorizationCode);
-			throw new Error("Authorization code expired");
+			throw new InvalidGrantError("Authorization code expired");
 		}
 		return entry.codeChallenge;
 	}
@@ -166,40 +226,24 @@ export class HevyOAuthProvider implements OAuthServerProvider {
 		redirectUri?: string,
 	): Promise<OAuthTokens> {
 		const entry = authCodes.get(authorizationCode);
-		if (!entry) throw new Error("Invalid authorization code");
+		if (!entry) throw new InvalidGrantError("Invalid authorization code");
 		if (Date.now() > entry.expiresAt) {
 			authCodes.delete(authorizationCode);
-			throw new Error("Authorization code expired");
+			throw new InvalidGrantError("Authorization code expired");
 		}
 		if (entry.clientId !== client.client_id)
-			throw new Error("Client ID mismatch");
+			throw new InvalidGrantError("Client ID mismatch");
 		if (redirectUri && entry.redirectUri !== redirectUri)
-			throw new Error("Redirect URI mismatch");
+			throw new InvalidGrantError("Redirect URI mismatch");
 		if (codeVerifier && !verifyPkce(codeVerifier, entry.codeChallenge))
-			throw new Error("PKCE verification failed");
+			throw new InvalidGrantError("PKCE verification failed");
 		authCodes.delete(authorizationCode);
 
-		const accessToken = generateToken();
-		const refreshToken = generateToken();
-		const now = Math.floor(Date.now() / 1000);
-		const expiresIn = 3600 * 24 * 90; // 90 days
-
-		accessTokens.set(accessToken, {
-			clientId: client.client_id,
-			scopes: [],
-			expiresAt: now + expiresIn,
-		});
-		refreshTokens.set(refreshToken, {
-			clientId: client.client_id,
-			scopes: [],
-			expiresAt: now + 3600 * 24 * 365,
-		});
-
 		return {
-			access_token: accessToken,
+			access_token: issueToken("access", client.client_id, ACCESS_TTL_S),
 			token_type: "Bearer",
-			expires_in: expiresIn,
-			refresh_token: refreshToken,
+			expires_in: ACCESS_TTL_S,
+			refresh_token: issueToken("refresh", client.client_id, REFRESH_TTL_S),
 			scope: "",
 		};
 	}
@@ -208,55 +252,44 @@ export class HevyOAuthProvider implements OAuthServerProvider {
 		client: OAuthClientInformationFull,
 		refreshToken: string,
 	): Promise<OAuthTokens> {
-		const entry = refreshTokens.get(refreshToken);
-		if (!entry) throw new Error("Invalid refresh token");
-		const now = Math.floor(Date.now() / 1000);
-		if (now > entry.expiresAt) {
-			refreshTokens.delete(refreshToken);
-			throw new Error("Refresh token expired");
-		}
-		if (entry.clientId !== client.client_id)
-			throw new Error("Client ID mismatch");
-
-		const accessToken = generateToken();
-		const expiresIn = 3600 * 24 * 90;
-		accessTokens.set(accessToken, {
-			clientId: client.client_id,
-			scopes: entry.scopes,
-			expiresAt: now + expiresIn,
-		});
+		// InvalidGrantError → 400 invalid_grant, so Claude falls back to a fresh
+		// authorization instead of retrying against a 500.
+		const entry = verifySigned<SignedToken>(refreshToken, "refresh");
+		if (!entry) throw new InvalidGrantError("Invalid refresh token");
+		if (Math.floor(Date.now() / 1000) > entry.exp)
+			throw new InvalidGrantError("Refresh token expired");
+		if (entry.c !== client.client_id)
+			throw new InvalidGrantError("Client ID mismatch");
 
 		return {
-			access_token: accessToken,
+			access_token: issueToken("access", client.client_id, ACCESS_TTL_S),
 			token_type: "Bearer",
-			expires_in: expiresIn,
+			expires_in: ACCESS_TTL_S,
 			refresh_token: refreshToken,
-			scope: entry.scopes.join(" "),
+			scope: "",
 		};
 	}
 
 	async verifyAccessToken(token: string): Promise<AuthInfo> {
-		const entry = accessTokens.get(token);
-		if (!entry) throw new Error("Invalid access token");
-		const now = Math.floor(Date.now() / 1000);
-		if (now > entry.expiresAt) {
-			accessTokens.delete(token);
-			throw new Error("Access token expired");
-		}
+		// InvalidTokenError → 401, which tells Claude to refresh or re-authorize.
+		const entry = verifySigned<SignedToken>(token, "access");
+		if (!entry) throw new InvalidTokenError("Invalid access token");
+		if (Math.floor(Date.now() / 1000) > entry.exp)
+			throw new InvalidTokenError("Access token expired");
 		return {
 			token,
-			clientId: entry.clientId,
-			scopes: entry.scopes,
-			expiresAt: entry.expiresAt,
+			clientId: entry.c,
+			scopes: [],
+			expiresAt: entry.exp,
 		};
 	}
 
 	async revokeToken(
 		_client: OAuthClientInformationFull,
-		request: OAuthTokenRevocationRequest,
+		_request: OAuthTokenRevocationRequest,
 	): Promise<void> {
-		accessTokens.delete(request.token);
-		refreshTokens.delete(request.token);
+		// Signed tokens can't be revoked individually; rotate OAUTH_SECRET to
+		// revoke all of them.
 	}
 
 	/**
