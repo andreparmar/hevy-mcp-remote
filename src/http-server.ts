@@ -29,9 +29,42 @@ import { registerWebhookTools } from "./tools/webhooks.js";
 import { registerWorkoutTools } from "./tools/workouts.js";
 import { assertApiKey, parseConfig } from "./utils/config.js";
 import { createClient } from "./utils/hevyClient.js";
+import { COLOR, notify } from "./utils/notify.js";
 import { HevyOAuthProvider } from "./oauth-provider.js";
 
 const HEVY_API_BASEURL = "https://api.hevyapp.com";
+
+/**
+ * Cheap liveness probe for the Hevy API key: GET /v1/workouts/count. Static API
+ * keys don't expire on their own, so this effectively catches a key that was
+ * rotated/revoked (the one Hevy failure mode worth alerting on). Never throws.
+ */
+async function checkApiKey(
+	apiKey: string,
+): Promise<
+	{ ok: true; count: number } | { ok: false; status: number; body: string }
+> {
+	try {
+		const resp = await fetch(`${HEVY_API_BASEURL}/v1/workouts/count`, {
+			headers: { "api-key": apiKey, accept: "application/json" },
+		});
+		if (!resp.ok) {
+			return {
+				ok: false,
+				status: resp.status,
+				body: (await resp.text()).slice(0, 300),
+			};
+		}
+		const data = (await resp.json()) as { workout_count?: number };
+		return { ok: true, count: data.workout_count ?? 0 };
+	} catch (err) {
+		return {
+			ok: false,
+			status: 0,
+			body: err instanceof Error ? err.message : String(err),
+		};
+	}
+}
 
 function buildMcpServer(apiKey: string): McpServer {
 	const server = new McpServer({ name: "hevy-mcp", version: "1.0.0" });
@@ -197,6 +230,81 @@ export async function runHttpServer() {
 			`OAuth discovery: ${publicUrl}/.well-known/oauth-authorization-server`,
 		);
 	});
+
+	// Status feed (Discord): verify the API key at startup and on a heartbeat, so a
+	// silently-rejected key (rotated/revoked) surfaces instead of failing reads quietly.
+	// No-op unless DISCORD_WEBHOOK_URL is set.
+	const heartbeatHours = Number(process.env.HEARTBEAT_HOURS ?? "12");
+	void (async () => {
+		const r = await checkApiKey(apiKey);
+		if (r.ok) {
+			void notify({
+				title: "🟢 Hevy MCP server started",
+				color: COLOR.ok,
+				fields: [
+					{
+						name: "Hevy API key",
+						value: `OK · ${r.count} workouts`,
+						inline: true,
+					},
+					{
+						name: "Heartbeat",
+						value: heartbeatHours > 0 ? `every ${heartbeatHours}h` : "off",
+						inline: true,
+					},
+					{ name: "Endpoint", value: `${publicUrl}/mcp` },
+				],
+			});
+		} else {
+			void notify({
+				title: "🔴 Hevy MCP started — API key REJECTED",
+				color: COLOR.error,
+				description:
+					"The Hevy API key failed its health check at startup. The MCP cannot read until HEVY_API_KEY is fixed (rotated or revoked?).",
+				fields: [
+					{ name: "Status", value: String(r.status), inline: true },
+					{ name: "Body", value: r.body || "—" },
+					{ name: "Endpoint", value: `${publicUrl}/mcp` },
+				],
+			});
+		}
+	})();
+
+	if (heartbeatHours > 0) {
+		const heartbeat = setInterval(
+			() => {
+				void (async () => {
+					const r = await checkApiKey(apiKey);
+					if (r.ok) {
+						void notify({
+							title: "💓 Hevy MCP — healthy",
+							color: COLOR.ok,
+							fields: [
+								{
+									name: "Hevy API key",
+									value: `OK · ${r.count} workouts`,
+									inline: true,
+								},
+							],
+						});
+					} else {
+						void notify({
+							title: "🔴 Hevy MCP — API key REJECTED",
+							color: COLOR.error,
+							description:
+								"The Hevy API key failed a health check. Fix HEVY_API_KEY (rotated or revoked?).",
+							fields: [
+								{ name: "Status", value: String(r.status), inline: true },
+								{ name: "Body", value: r.body || "—" },
+							],
+						});
+					}
+				})();
+			},
+			heartbeatHours * 60 * 60 * 1000,
+		);
+		heartbeat.unref();
+	}
 }
 
 // Prevent a single bad request from killing the process
@@ -208,8 +316,16 @@ process.on("unhandledRejection", (reason) => {
 });
 
 // Self-invoke when used as an entry point (mirrors cli.ts pattern)
-void runHttpServer().catch((error: unknown) => {
+void runHttpServer().catch(async (error: unknown) => {
+	const message = error instanceof Error ? error.message : String(error);
 	console.error("Fatal error:", error);
+	await notify({
+		title: "🔴 Hevy MCP failed to start",
+		color: COLOR.error,
+		description:
+			"The server could not boot. Check HEVY_API_KEY / OAUTH_SECRET / PUBLIC_URL in Railway.",
+		fields: [{ name: "Error", value: message.slice(0, 1000) }],
+	});
 	process.exit(1);
 });
 
